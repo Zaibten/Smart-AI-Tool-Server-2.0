@@ -2,10 +2,11 @@ const express = require("express");
 const mongoose = require("mongoose");
 const dotenv = require("dotenv");
 const path = require('path');
-
+const fetch = require('node-fetch');
 
 const nodemailer = require("nodemailer");
 const cors = require("cors");
+const algoliasearch = require("algoliasearch");
 
 dotenv.config();
 
@@ -42,6 +43,24 @@ mongoose
   .connect(mongoURI, { useNewUrlParser: true, useUnifiedTopology: true })
   .then(() => console.log("✅ MongoDB Connected Successfully"))
   .catch((err) => console.error("❌ MongoDB Connection Error:", err));
+
+
+// =========================
+//  Algolia Configuration
+// =========================
+console.log("✅ Algolia App ID:", process.env.ALGOLIA_APP_ID);
+console.log(
+  "✅ Algolia API Key:",
+  process.env.ALGOLIA_ADMIN_API_KEY ? "Loaded" : "Missing"
+);
+console.log("✅ Algolia Index:", process.env.ALGOLIA_INDEX_NAME);
+
+const client = algoliasearch(
+  process.env.ALGOLIA_APP_ID,
+  process.env.ALGOLIA_ADMIN_API_KEY
+);
+const index = client.initIndex(process.env.ALGOLIA_INDEX_NAME);
+
 
 // Tool Schema
 const toolSchema = new mongoose.Schema(
@@ -138,27 +157,140 @@ app.get("/api/tools/count", async (req, res) => {
   }
 });
 
-// GET /api/tools/search?q=searchText
-app.get("/api/tools/search", async (req, res) => {
+app.get("/api/sync-algolia", async (req, res) => {
+  try {
+    const tools = await Tool.find();
+
+    const formatted = tools.map((tool) => ({
+      objectID: tool._id.toString(),
+      name: tool.name,
+      description: tool.description,
+      category: tool.category,
+      pricing: tool.pricing,
+      profession: tool.profession,
+      tags: tool.tags,
+      new_description: tool.new_description,
+      link: tool.link,
+      image_url: tool.image_url,
+    }));
+
+    await index.saveObjects(formatted);
+    res.json({ success: true, message: "✅ Tools synced to Algolia successfully!" });
+  } catch (err) {
+    console.error("Algolia sync error:", err);
+    res.status(500).json({ error: "Failed to sync data with Algolia" });
+  }
+});
+
+app.get("/api/searchtools", async (req, res) => {
   const { q } = req.query;
   if (!q) return res.json([]);
 
   try {
-    const regex = new RegExp(q, "i"); // case-insensitive search
-    const tools = await Tool.find({
+    // === Step 1: Extract meaningful intent keywords ===
+    const hfResponse = await fetch(
+      "https://api-inference.huggingface.co/models/facebook/bart-large-mnli",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          inputs: `Extract the main AI tool intent keywords from: "${q}"`,
+        }),
+      }
+    );
+
+    const hfData = await hfResponse.json();
+    const extracted =
+      hfData[0]?.generated_text ||
+      hfData[0]?.summary_text ||
+      q.toLowerCase().trim();
+    console.log("🎯 Refined query:", extracted);
+
+    // === Step 2: Search Algolia for those refined keywords ===
+    const algoliaResult = await index.search(extracted, {
+      typoTolerance: "min",
+      hitsPerPage: 40,
+      ignorePlurals: true,
+      removeWordsIfNoResults: "allOptional",
+      filters: 'NOT category:"unrelated"',
+    });
+
+    let hits = algoliaResult.hits;
+
+    // === Step 3: (Optional) Secondary relevance filter using MongoDB ===
+    const regex = new RegExp(extracted.split(" ").join("|"), "i");
+    const mongoResults = await Tool.find({
       $or: [
         { name: regex },
         { description: regex },
         { new_description: regex },
+        { category: regex },
         { tags: regex },
+        { profession: regex },
       ],
     });
-    res.json(tools);
+
+    // Merge Algolia + Mongo results (unique by _id / objectID)
+    const mongoIds = new Set(mongoResults.map((t) => String(t._id)));
+    const combined = [
+      ...hits.filter((h) => !mongoIds.has(String(h.objectID))),
+      ...mongoResults.map((t) => ({
+        objectID: t._id,
+        name: t.name,
+        description: t.description,
+        category: t.category,
+        pricing: t.pricing,
+        link: t.link,
+        image_url: t.image_url,
+        rating: (Math.random() * (4.8 - 4.3) + 4.3).toFixed(1),
+      })),
+    ];
+
+    // === Step 4: Score by semantic closeness (simple string similarity) ===
+    const normalizedQ = extracted.toLowerCase();
+    const scored = combined
+      .map((item) => {
+        const text =
+          `${item.name} ${item.description} ${item.category}`.toLowerCase();
+        let score = 0;
+        normalizedQ.split(" ").forEach((word) => {
+          if (text.includes(word)) score += 1;
+        });
+        return { ...item, _score: score };
+      })
+      .sort((a, b) => b._score - a._score)
+      .filter((i) => i._score > 0); // remove unrelated ones
+
+    // === Step 5: Return refined list ===
+    res.json(scored.slice(0, 20)); // return top 20 most relevant tools
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Search failed" });
+    console.error("🔴 Advanced search error:", err);
+    res.status(500).json({ error: "Semantic search failed" });
   }
 });
+
+
+// GET /api/tools/search?q=searchText
+// app.get("/api/tools/search", async (req, res) => {
+//   const { q } = req.query;
+//   if (!q) return res.json([]);
+
+//   try {
+//     const regex = new RegExp(q, "i"); // case-insensitive search
+//     const tools = await Tool.find({
+//       $or: [
+//         { name: regex },
+//         { description: regex },
+//         { new_description: regex },
+//         { tags: regex },
+//       ],
+//     });
+//     res.json(tools);
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).json({ error: "Search failed" });
+//   }
+// });
 
 
 // Generate random rating between 4.0 and 4.8
