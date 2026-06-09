@@ -182,6 +182,7 @@ app.get("/api/sync-algolia", async (req, res) => {
   }
 });
 
+
 app.get("/api/searchtools", async (req, res) => {
   const { q } = req.query;
   if (!q) return res.json([]);
@@ -268,7 +269,6 @@ app.get("/api/searchtools", async (req, res) => {
     res.status(500).json({ error: "Semantic search failed" });
   }
 });
-
 
 // GET /api/tools/search?q=searchText
 // app.get("/api/tools/search", async (req, res) => {
