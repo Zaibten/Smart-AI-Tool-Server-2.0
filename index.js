@@ -190,41 +190,45 @@ app.get("/api/searchtools", async (req, res) => {
   if (!q) return res.json([]);
 
   const query = q.toLowerCase().trim();
+  const words = query.split(/\s+/).filter(Boolean);
 
   try {
-    // === Step 1: Algolia primary search ===
+    // === Step 1: Algolia with prefix + typo tolerance ===
     const algoliaResult = await index.search(query, {
-  typoTolerance: true,          // ✅ was "min" — now allows up to 2 typos
-  minWordSizefor1Typo: 4,       // words 4+ chars get 1 typo allowed
-  minWordSizefor2Typos: 7,      // words 7+ chars get 2 typos allowed  
-  hitsPerPage: 40,
-  ignorePlurals: true,
-  removeWordsIfNoResults: "allOptional",
-  attributesToRetrieve: [
-    "objectID", "name", "description", "category",
-    "pricing", "link", "image_url", "tags", "profession", "new_description"
-  ],
-});
+      typoTolerance: true,
+      minWordSizefor1Typo: 3,        // ✅ "mache" (5 chars) gets typo allowance
+      minWordSizefor2Typos: 6,
+      hitsPerPage: 40,
+      ignorePlurals: true,
+      removeWordsIfNoResults: "allOptional",
+      queryType: "prefixAll",        // ✅ treats every word as a prefix — "mache" matches "machine"
+      attributesToRetrieve: [
+        "objectID", "name", "description", "category",
+        "pricing", "link", "image_url", "tags", "profession", "new_description"
+      ],
+    });
 
     const hits = algoliaResult.hits;
     const algoliaIds = new Set(hits.map((h) => String(h.objectID)));
 
-    // === Step 2: MongoDB fallback for anything Algolia missed ===
-    const words = query.split(/\s+/).filter(Boolean);
-    const regex = new RegExp(words.join("|"), "i");
+    // === Step 2: MongoDB fallback with prefix regex ===
+    // Build prefix regex for each word — "mache" → /^mache/i won't work
+    // Instead match the word anywhere as a substring prefix of each token
+    const mongoOrClauses = words.flatMap((word) => {
+      const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const re = new RegExp(escaped, "i"); // substring match — "mache" inside "machine"
+      return [
+        { name: re },
+        { description: re },
+        { new_description: re },
+        { category: re },
+        { tags: re },
+        { profession: re },
+      ];
+    });
 
-    const mongoResults = await Tool.find({
-      $or: [
-        { name: regex },
-        { description: regex },
-        { new_description: regex },
-        { category: regex },
-        { tags: regex },
-        { profession: regex },
-      ],
-    }).limit(30);
+    const mongoResults = await Tool.find({ $or: mongoOrClauses }).limit(30);
 
-    // Merge — Algolia results first, then any MongoDB extras not already in Algolia
     const mongoExtras = mongoResults
       .filter((t) => !algoliaIds.has(String(t._id)))
       .map((t) => ({
@@ -242,25 +246,25 @@ app.get("/api/searchtools", async (req, res) => {
 
     const combined = [...hits, ...mongoExtras];
 
-    // === Step 3: Score by keyword relevance ===
+    // === Step 3: Score — prefix bonus so "mache" ranks "machine learning" high ===
     const scored = combined
       .map((item) => {
+        const nameLower = item.name?.toLowerCase() || "";
+        const categoryLower = item.category?.toLowerCase() || "";
         const searchText = [
-          item.name,
           item.description,
           item.new_description,
-          item.category,
           ...(item.tags || []),
           ...(item.profession || []),
-        ]
-          .join(" ")
-          .toLowerCase();
+        ].join(" ").toLowerCase();
 
         let score = 0;
         words.forEach((word) => {
-          if (item.name?.toLowerCase().includes(word)) score += 3;      // name match = highest weight
-          else if (item.category?.toLowerCase().includes(word)) score += 2;
-          else if (searchText.includes(word)) score += 1;
+          if (nameLower === word) score += 10;                    // exact name match
+          else if (nameLower.startsWith(word)) score += 7;        // name starts with word
+          else if (nameLower.includes(word)) score += 5;          // name contains word
+          else if (categoryLower.includes(word)) score += 3;      // category match
+          else if (searchText.includes(word)) score += 1;         // body match
         });
 
         return {
