@@ -189,39 +189,28 @@ app.get("/api/searchtools", async (req, res) => {
   const { q } = req.query;
   if (!q) return res.json([]);
 
+  const query = q.toLowerCase().trim();
+
   try {
-    // === Step 1: Extract meaningful intent keywords ===
-    const hfResponse = await fetch(
-      "https://api-inference.huggingface.co/models/facebook/bart-large-mnli",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          inputs: `Extract the main AI tool intent keywords from: "${q}"`,
-        }),
-      }
-    );
-
-    const hfData = await hfResponse.json();
-    const extracted =
-      hfData[0]?.generated_text ||
-      hfData[0]?.summary_text ||
-      q.toLowerCase().trim();
-    console.log("🎯 Refined query:", extracted);
-
-    // === Step 2: Search Algolia for those refined keywords ===
-    const algoliaResult = await index.search(extracted, {
+    // === Step 1: Algolia primary search ===
+    const algoliaResult = await index.search(query, {
       typoTolerance: "min",
       hitsPerPage: 40,
       ignorePlurals: true,
       removeWordsIfNoResults: "allOptional",
-      filters: 'NOT category:"unrelated"',
+      attributesToRetrieve: [
+        "objectID", "name", "description", "category",
+        "pricing", "link", "image_url", "tags", "profession", "new_description"
+      ],
     });
 
-    let hits = algoliaResult.hits;
+    const hits = algoliaResult.hits;
+    const algoliaIds = new Set(hits.map((h) => String(h.objectID)));
 
-    // === Step 3: (Optional) Secondary relevance filter using MongoDB ===
-    const regex = new RegExp(extracted.split(" ").join("|"), "i");
+    // === Step 2: MongoDB fallback for anything Algolia missed ===
+    const words = query.split(/\s+/).filter(Boolean);
+    const regex = new RegExp(words.join("|"), "i");
+
     const mongoResults = await Tool.find({
       $or: [
         { name: regex },
@@ -231,44 +220,60 @@ app.get("/api/searchtools", async (req, res) => {
         { tags: regex },
         { profession: regex },
       ],
-    });
+    }).limit(30);
 
-    // Merge Algolia + Mongo results (unique by _id / objectID)
-    const mongoIds = new Set(mongoResults.map((t) => String(t._id)));
-    const combined = [
-      ...hits.filter((h) => !mongoIds.has(String(h.objectID))),
-      ...mongoResults.map((t) => ({
+    // Merge — Algolia results first, then any MongoDB extras not already in Algolia
+    const mongoExtras = mongoResults
+      .filter((t) => !algoliaIds.has(String(t._id)))
+      .map((t) => ({
         objectID: t._id,
         name: t.name,
         description: t.description,
+        new_description: t.new_description,
         category: t.category,
         pricing: t.pricing,
         link: t.link,
         image_url: t.image_url,
-        rating: (Math.random() * (4.8 - 4.3) + 4.3).toFixed(1),
-      })),
-    ];
+        tags: t.tags,
+        profession: t.profession,
+      }));
 
-    // === Step 4: Score by semantic closeness (simple string similarity) ===
-    const normalizedQ = extracted.toLowerCase();
+    const combined = [...hits, ...mongoExtras];
+
+    // === Step 3: Score by keyword relevance ===
     const scored = combined
       .map((item) => {
-        const text =
-          `${item.name} ${item.description} ${item.category}`.toLowerCase();
-        let score = 0;
-        normalizedQ.split(" ").forEach((word) => {
-          if (text.includes(word)) score += 1;
-        });
-        return { ...item, _score: score };
-      })
-      .sort((a, b) => b._score - a._score)
-      .filter((i) => i._score > 0); // remove unrelated ones
+        const searchText = [
+          item.name,
+          item.description,
+          item.new_description,
+          item.category,
+          ...(item.tags || []),
+          ...(item.profession || []),
+        ]
+          .join(" ")
+          .toLowerCase();
 
-    // === Step 5: Return refined list ===
-    res.json(scored.slice(0, 20)); // return top 20 most relevant tools
+        let score = 0;
+        words.forEach((word) => {
+          if (item.name?.toLowerCase().includes(word)) score += 3;      // name match = highest weight
+          else if (item.category?.toLowerCase().includes(word)) score += 2;
+          else if (searchText.includes(word)) score += 1;
+        });
+
+        return {
+          ...item,
+          rating: (Math.random() * (4.8 - 4.3) + 4.3).toFixed(1),
+          _score: score,
+        };
+      })
+      .filter((i) => i._score > 0)
+      .sort((a, b) => b._score - a._score);
+
+    res.json(scored.slice(0, 20));
   } catch (err) {
-    console.error("🔴 Advanced search error:", err);
-    res.status(500).json({ error: "Semantic search failed" });
+    console.error("🔴 Search error:", err);
+    res.status(500).json({ error: "Search failed" });
   }
 });
 
