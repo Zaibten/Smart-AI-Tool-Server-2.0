@@ -15,6 +15,7 @@ const PORT = process.env.PORT || 5000;
 
 const allowedOrigins = [
   'https://smartaitools.vercel.app',
+  'https://www.selectaitool.com/',
   'http://localhost:4028'
 ];
 
