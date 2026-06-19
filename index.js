@@ -194,15 +194,17 @@ app.get("/api/searchtools", async (req, res) => {
   try {
     // === Step 1: Algolia primary search ===
     const algoliaResult = await index.search(query, {
-      typoTolerance: "min",
-      hitsPerPage: 40,
-      ignorePlurals: true,
-      removeWordsIfNoResults: "allOptional",
-      attributesToRetrieve: [
-        "objectID", "name", "description", "category",
-        "pricing", "link", "image_url", "tags", "profession", "new_description"
-      ],
-    });
+  typoTolerance: true,          // ✅ was "min" — now allows up to 2 typos
+  minWordSizefor1Typo: 4,       // words 4+ chars get 1 typo allowed
+  minWordSizefor2Typos: 7,      // words 7+ chars get 2 typos allowed  
+  hitsPerPage: 40,
+  ignorePlurals: true,
+  removeWordsIfNoResults: "allOptional",
+  attributesToRetrieve: [
+    "objectID", "name", "description", "category",
+    "pricing", "link", "image_url", "tags", "profession", "new_description"
+  ],
+});
 
     const hits = algoliaResult.hits;
     const algoliaIds = new Set(hits.map((h) => String(h.objectID)));
